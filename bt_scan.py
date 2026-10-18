@@ -549,6 +549,19 @@ def unwrap(v):
     return v
 
 
+# Zaehlt gueltige/ungueltige RSSI-Werte, um Dongles ohne Pegelmessung zu erkennen
+RSSI_STATS = {"valid": 0, "invalid": 0}
+
+
+def rssi_valid(rssi):
+    """127 bedeutet laut Bluetooth-Spezifikation 'nicht verfuegbar'; positive Werte sind unrealistisch."""
+    return rssi is not None and -127 < rssi < 20
+
+
+RSSI_WARNING = ("Achtung: Der Dongle liefert keine Signalstaerke (RSSI 127 = 'nicht verfuegbar'). "
+                "Geraete werden gefunden, aber ohne dBm-Wert. Typisch fuer gefaelschte CSR-Dongles.")
+
+
 class Device:
     def __init__(self, path):
         self.path = path
@@ -572,6 +585,12 @@ class Device:
         self.probe_fail = 0.0      # letzte erfolglose Namensabfrage
 
     def update(self, props, seen=True):
+        if "RSSI" in props:
+            if rssi_valid(props["RSSI"]):
+                RSSI_STATS["valid"] += 1
+            else:
+                RSSI_STATS["invalid"] += 1
+                props = {k: v for k, v in props.items() if k != "RSSI"}
         self.props.update(props)
         rssi = props.get("RSSI")
         if rssi is not None:
@@ -738,8 +757,7 @@ def parse_hci_event(evt, p):
                     props["AddressType"] = "random" if atype in (1, 3) else "public"
                     if etype != 0x04:               # Scan Response sagt nichts ueber Verbindbarkeit
                         props["Connectable"] = etype in (0x00, 0x01)
-                    if rssi != 127:
-                        props["RSSI"] = rssi
+                    props["RSSI"] = rssi
                     props["LE"] = True
                     out.append((addr, props))
             elif sub == 0x0D:                       # LE Extended Advertising Report
@@ -759,8 +777,7 @@ def parse_hci_event(evt, p):
                     props["AddressType"] = "random" if atype in (1, 3) else "public"
                     if not etype & 0x08:
                         props["Connectable"] = bool(etype & 0x01)
-                    if rssi != 127:
-                        props["RSSI"] = rssi
+                    props["RSSI"] = rssi
                     if tx != 127 and "TxPower" not in props:
                         props["TxPower"] = tx
                     props["LE"] = True
@@ -769,8 +786,7 @@ def parse_hci_event(evt, p):
             props = parse_ad(p[15:])
             props["Class"] = int.from_bytes(p[9:12], "little")
             rssi = struct.unpack("b", p[14:15])[0]
-            if rssi != 127:
-                props["RSSI"] = rssi
+            props["RSSI"] = rssi
             props["AddressType"] = "public"
             out.append((bdaddr_str(p[1:7]), props))
         elif evt == 0x22 and p:                     # Inquiry Result with RSSI
@@ -1250,6 +1266,8 @@ class Scanner:
                f"  |  {len(devs)} Geraete (letzte {self.args.timeout}s)  |  "
                f"Laufzeit {fmt_duration(time.time() - self.started)}  |  {time.strftime('%H:%M:%S')}")
         lines.append(c(hdr, "1", color))
+        if self.rssi_problem():
+            lines.append(c(RSSI_WARNING, "33", color))
         lines.append(c("Name - MAC - Signal", "2", color))
         lines.append("")
         for d in devs:
@@ -1289,9 +1307,15 @@ class Scanner:
             })
         return out
 
+    def rssi_problem(self):
+        """True, wenn der Dongle (fast) nur ungueltige Signalwerte liefert."""
+        return RSSI_STATS["invalid"] >= 20 and RSSI_STATS["valid"] < RSSI_STATS["invalid"] / 20
+
     def status(self):
         a = self.adapter_props
         return {
+            "rssi_problem": self.rssi_problem(),
+            "rssi_stats": dict(RSSI_STATS),
             "adapter": self.adapter_path.rsplit("/", 1)[-1] if self.adapter_path else None,
             "adapter_address": a.get("Address"), "adapter_name": a.get("Alias") or a.get("Name"),
             "discovering": bool(a.get("Discovering")), "transport": self.args.transport,

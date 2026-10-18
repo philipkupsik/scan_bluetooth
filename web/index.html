@@ -101,6 +101,8 @@
   .spark .legend { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 4px; }
 
   .empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+  .warn { margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; background: rgba(217, 154, 6, .14); color: var(--text); border-left: 4px solid var(--mid); }
+  .warn b { color: var(--mid); }
   .err { margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; background: rgba(214, 69, 69, .12); color: var(--bad); display: none; }
   footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
 
@@ -146,6 +148,11 @@
   </header>
 
   <div id="error" class="err"></div>
+  <div id="rssiwarn" class="warn" hidden>
+    <b>Keine Signalstärke vom Dongle.</b> Der Bluetooth-Adapter meldet bei jedem Paket den Wert 127, laut
+    Bluetooth-Standard „nicht verfügbar“. Die Geräte werden trotzdem gefunden, nur ohne dBm-Wert.
+    Das passiert vor allem bei gefälschten CSR-8510-Dongles und manchen Realtek-Chips.
+  </div>
 
   <section class="tiles">
     <div class="tile"><div class="k">Geräte in Reichweite</div><div class="v" id="t-total">–</div><div class="s" id="t-total-s">&nbsp;</div></div>
@@ -282,6 +289,7 @@
   function render() {
     const s = data.status || {};
     const all = data.devices;
+    $("rssiwarn").hidden = !s.rssi_problem;
     $("adapter").textContent = s.adapter ? `${s.adapter}${s.adapter_address ? " (" + s.adapter_address + ")" : ""}` : "–";
     $("uptime").textContent = s.uptime != null ? dur(s.uptime) : "–";
     $("stamp").textContent = s.timestamp ? s.timestamp.slice(11) : "–";
