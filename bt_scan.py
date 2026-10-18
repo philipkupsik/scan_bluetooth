@@ -15,6 +15,7 @@ Benoetigt: bluez (bluetoothd laeuft), Python >= 3.9, Paket "dbus-fast".
 
 import argparse
 import asyncio
+import base64
 import csv
 import json
 import os
@@ -38,6 +39,7 @@ IFACE_OM = "org.freedesktop.DBus.ObjectManager"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+WEB_INDEX = os.path.join(SCRIPT_DIR, "web", "index.html")
 
 SIG_BASE = "https://bitbucket.org/bluetooth-SIG/public/raw/main/assigned_numbers"
 DOWNLOADS = {
@@ -943,18 +945,98 @@ class Scanner:
         return "\n".join(lines)
 
     def snapshot(self):
+        now = time.time()
         out = []
         for d in self.visible_devices():
+            p = d.props
             out.append({
                 "name": d.name, "mac": d.address, "rssi": d.rssi,
                 "rssi_min": d.rssi_min, "rssi_max": d.rssi_max,
+                "rssi_avg": d.rssi_sum // d.rssi_count if d.rssi_count else None,
                 "transport": d.transport,
+                "address_type": address_type_info(d.address, p.get("AddressType", "public")),
+                "vendor": device_vendor(d, self.db),
+                "kind": device_kind(d),
+                "tx_power": p.get("TxPower"),
+                "paired": bool(p.get("Paired")), "connected": bool(p.get("Connected")),
+                "updates": d.updates,
+                "age": round(now - d.last_seen, 1),
                 "last_seen": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(d.last_seen)),
                 "first_seen": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(d.first_seen)),
                 "details": device_details(d, self.db),
                 "gatt": d.gatt,
+                "gatt_state": d.gatt_state,
             })
         return out
+
+    def status(self):
+        a = self.adapter_props
+        return {
+            "adapter": self.adapter_path.rsplit("/", 1)[-1] if self.adapter_path else None,
+            "adapter_address": a.get("Address"), "adapter_name": a.get("Alias") or a.get("Name"),
+            "discovering": bool(a.get("Discovering")), "transport": self.args.transport,
+            "deep": self.args.deep, "timeout": self.args.timeout,
+            "uptime": round(time.time() - self.started), "known_devices": len(self.devices),
+            "databases": self.db.sources,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+    # ---------------- Weboberflaeche --------------------------------------
+
+    async def start_web(self):
+        host, _, port = self.args.web.rpartition(":")
+        host = host or "0.0.0.0"
+        try:
+            server = await asyncio.start_server(self.handle_http, host, int(port))
+        except OSError as e:
+            raise SystemExit(f"Weboberflaeche konnte nicht auf {host}:{port} starten: {e}")
+        shown = host if host != "0.0.0.0" else "<IP-des-Containers>"
+        print(f"Weboberflaeche: http://{shown}:{port}/", file=sys.stderr, flush=True)
+        return server
+
+    async def handle_http(self, reader, writer):
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
+            lines = head.decode("latin-1").split("\r\n")
+            method, target = lines[0].split(" ")[:2]
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            path = target.split("?", 1)[0]
+
+            if self.args.web_auth:
+                expected = "Basic " + base64.b64encode(self.args.web_auth.encode()).decode()
+                if headers.get("authorization") != expected:
+                    await http_reply(writer, 401, b"Anmeldung erforderlich", "text/plain; charset=utf-8",
+                                     {"WWW-Authenticate": 'Basic realm="bt_scan"'})
+                    return
+            if method != "GET":
+                await http_reply(writer, 405, b"Nur GET", "text/plain; charset=utf-8")
+            elif path in ("/", "/index.html"):
+                try:
+                    with open(WEB_INDEX, "rb") as f:
+                        body = f.read()
+                except OSError:
+                    body = b"web/index.html fehlt"
+                await http_reply(writer, 200, body, "text/html; charset=utf-8")
+            elif path == "/api/devices":
+                body = json.dumps({"status": self.status(), "devices": self.snapshot()}, ensure_ascii=False)
+                await http_reply(writer, 200, body.encode(), "application/json; charset=utf-8")
+            else:
+                await http_reply(writer, 404, b"Nicht gefunden", "text/plain; charset=utf-8")
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            if self.args.debug:
+                print(f"HTTP-Fehler: {e}", file=sys.stderr)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def display_loop(self):
         interactive = sys.stdout.isatty()
@@ -972,6 +1054,7 @@ class Scanner:
 
     async def run(self):
         await self.setup()
+        server = await self.start_web() if self.args.web else None
         tasks = [asyncio.create_task(self.watchdog()), asyncio.create_task(self.display_loop())]
         if self.args.deep:
             tasks.append(asyncio.create_task(self.gatt_worker()))
@@ -985,6 +1068,8 @@ class Scanner:
         finally:
             for t in tasks:
                 t.cancel()
+            if server:
+                server.close()
             await self.stop_discovery()
         if self.args.once:
             if self.args.json:
@@ -1027,6 +1112,41 @@ def format_main_line(d, color):
     age = time.time() - d.last_seen
     agetxt = f"  (vor {int(age)}s)" if age >= 5 else ""
     return f"{c(name, '1', color)} - {d.address} - {sig}{agetxt}"
+
+
+def device_vendor(d, db):
+    """Kurzbezeichnung des Herstellers fuer die Uebersicht."""
+    if d.gatt.get("Hersteller"):
+        return d.gatt["Hersteller"]
+    for cid in (d.props.get("ManufacturerData") or {}):
+        name = db.company(cid)
+        if name:
+            return name
+    if d.props.get("AddressType", "public") == "public":
+        return db.oui_vendor(d.address)
+    return None
+
+
+def device_kind(d):
+    """Kurzbezeichnung der Geraeteart fuer die Uebersicht."""
+    p = d.props
+    if d.gatt.get("Modell"):
+        return d.gatt["Modell"]
+    if "Appearance" in p:
+        return decode_appearance(p["Appearance"]).rsplit(" (", 1)[0]
+    if "Class" in p:
+        return decode_cod(p["Class"]).split("  [", 1)[0]
+    return p.get("Icon")
+
+
+async def http_reply(writer, status, body, ctype, extra=None):
+    reasons = {200: "OK", 401: "Unauthorized", 404: "Not Found", 405: "Method Not Allowed"}
+    head = [f"HTTP/1.1 {status} {reasons.get(status, '')}", f"Content-Type: {ctype}",
+            f"Content-Length: {len(body)}", "Cache-Control: no-store", "Connection: close"]
+    for k, v in (extra or {}).items():
+        head.append(f"{k}: {v}")
+    writer.write(("\r\n".join(head) + "\r\n\r\n").encode() + body)
+    await writer.drain()
 
 
 def device_details(d, db):
@@ -1130,8 +1250,9 @@ def write_json(path, data):
 def parse_args():
     ap = argparse.ArgumentParser(description="Dauerhafter Bluetooth-Scanner (Classic + BLE) fuer BlueZ.")
     ap.add_argument("-a", "--adapter", help="Adapter (z.B. hci0 oder MAC), Standard: erster gefundener")
-    ap.add_argument("-m", "--mode", choices=["live", "log"], default="live",
-                    help="live = Bildschirm wird laufend aktualisiert (Standard), log = fortlaufende Zeilen")
+    ap.add_argument("-m", "--mode", choices=["live", "log", "none"], default="live",
+                    help="live = Bildschirm wird laufend aktualisiert (Standard), log = fortlaufende Zeilen, "
+                         "none = keine Terminalausgabe (z.B. nur Weboberflaeche)")
     ap.add_argument("-t", "--transport", choices=["auto", "le", "bredr"], default="auto",
                     help="auto = Classic + BLE (Standard), le = nur BLE (schnellste Updates), bredr = nur Classic")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="Aktualisierungsintervall in s (Standard 1)")
@@ -1149,6 +1270,9 @@ def parse_args():
     ap.add_argument("--once", type=float, metavar="SEK", help="X Sekunden scannen, Ergebnis ausgeben, beenden")
     ap.add_argument("--update-db", action="store_true",
                     help="Hersteller-Datenbanken (IEEE OUI, Bluetooth SIG) herunterladen und beenden")
+    ap.add_argument("-w", "--web", metavar="[HOST:]PORT",
+                    help="Weboberflaeche starten, z.B. --web 8080 oder --web 127.0.0.1:8080")
+    ap.add_argument("--web-auth", metavar="USER:PASSWORT", help="Weboberflaeche mit Passwort schuetzen")
     ap.add_argument("--no-color", action="store_true", help="Keine Farben")
     ap.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     return ap.parse_args()

@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluetooth-Scan</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7 7l10 10-5 5V2l5 5L7 17' fill='none' stroke='%232f6fe4' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f0f2f5; --border: #e1e4e9;
+    --text: #1b1f27; --muted: #667085; --accent: #2f6fe4; --accent-soft: #e6eefc;
+    --good: #12a150; --mid: #d99a06; --bad: #d64545; --none: #c3c8d0;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .05);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --panel: #171b23; --panel-2: #1e232d; --border: #2a303b;
+      --text: #e6e9ef; --muted: #8a93a3; --accent: #6b9bff; --accent-soft: #1d2a45;
+      --good: #34c46f; --mid: #e8b33a; --bad: #f06a6a; --none: #3a414d;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 20px 16px 48px; }
+
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-bottom: 18px; }
+  header h1 { font-size: 20px; margin: 0; display: flex; align-items: center; gap: 10px; }
+  header h1 svg { width: 22px; height: 22px; color: var(--accent); }
+  .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; }
+  .meta b { color: var(--text); font-weight: 500; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--none); margin-right: 6px; vertical-align: 1px; }
+  .dot.on { background: var(--good); box-shadow: 0 0 0 0 var(--good); animation: pulse 2s infinite; }
+  .dot.err { background: var(--bad); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(18,161,80,.5); } 70% { box-shadow: 0 0 0 7px rgba(18,161,80,0); } 100% { box-shadow: 0 0 0 0 rgba(18,161,80,0); } }
+  .spacer { flex: 1; }
+  button, select, input[type=search] {
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 11px;
+  }
+  button { cursor: pointer; }
+  button:hover { background: var(--panel-2); }
+  input[type=search] { min-width: 0; width: 100%; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; box-shadow: var(--shadow); }
+  .tile .k { color: var(--muted); font-size: 12px; }
+  .tile .v { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .s { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto auto auto; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+  .seg button { border: 0; border-radius: 0; padding: 7px 12px; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .range { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .range input { width: 110px; accent-color: var(--accent); }
+  .range output { font-variant-numeric: tabular-nums; color: var(--text); min-width: 58px; }
+  label.chk { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--panel-2); cursor: pointer; user-select: none; white-space: nowrap; }
+  th.sorted::after { content: " ▾"; }
+  th.sorted.asc::after { content: " ▴"; }
+  tbody tr.row { cursor: pointer; }
+  tbody tr.row:hover { background: var(--panel-2); }
+  tbody tr.row.open { background: var(--accent-soft); }
+  tr.stale td { opacity: .55; }
+  td.name { font-weight: 600; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.name .unk { color: var(--muted); font-weight: 400; font-style: italic; }
+  td.mac { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
+  td.vendor, td.kind { color: var(--muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.age { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .sig { display: flex; align-items: center; gap: 8px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 16px; }
+  .bars i { display: block; width: 4px; border-radius: 1px; background: var(--none); }
+  .bars i:nth-child(1) { height: 20%; } .bars i:nth-child(2) { height: 40%; } .bars i:nth-child(3) { height: 60%; }
+  .bars i:nth-child(4) { height: 80%; } .bars i:nth-child(5) { height: 100%; }
+  .bars.good i.on { background: var(--good); } .bars.mid i.on { background: var(--mid); } .bars.bad i.on { background: var(--bad); }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); white-space: nowrap; }
+  .badge.ble { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+  .badge.classic { color: #8a4fd8; background: rgba(138, 79, 216, .12); border-color: transparent; }
+  .badge.dual { color: var(--good); background: rgba(18, 161, 80, .12); border-color: transparent; }
+  .badge.st { margin-left: 6px; }
+
+  tr.detail td { background: var(--panel-2); padding: 14px 16px 16px; }
+  .det { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; }
+  dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  dd.raw { font-family: var(--mono); font-size: 12px; }
+  .spark h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; }
+  .spark svg { width: 100%; height: 90px; display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .spark .legend { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+  .empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+  .err { margin-bottom: 12px; padding: 10px 14px; border-radius: 10px; background: rgba(214, 69, 69, .12); color: var(--bad); display: none; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
+
+  @media (max-width: 900px) {
+    .toolbar { grid-template-columns: 1fr 1fr; }
+    .toolbar .search { grid-column: 1 / -1; }
+    .det { grid-template-columns: 1fr; }
+    th.c-kind, td.kind, th.c-vendor, td.vendor { display: none; }
+  }
+  @media (max-width: 600px) {
+    .toolbar { grid-template-columns: 1fr; }
+    .seg button { flex: 1; }
+    thead { display: none; }
+    table, tbody, tr, td { display: block; }
+    tbody tr.row { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    tbody tr.row td { border: 0; padding: 0; }
+    td.name { grid-column: 1; max-width: none; }
+    td.sigc { grid-column: 2; grid-row: 1; }
+    td.mac { grid-column: 1; }
+    td.type { grid-column: 2; grid-row: 2; text-align: right; }
+    td.vendor { display: block !important; grid-column: 1 / -1; max-width: none; }
+    td.age { display: none; }
+    dl { grid-template-columns: 1fr; gap: 0; }
+    dt { margin-top: 6px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7l10 10-5 5V2l5 5L7 17"/></svg>
+      Bluetooth-Scan
+    </h1>
+    <div class="meta">
+      <span><span id="dot" class="dot"></span><span id="state">verbinde …</span></span>
+      <span>Adapter <b id="adapter">–</b></span>
+      <span>Laufzeit <b id="uptime">–</b></span>
+      <span>Stand <b id="stamp">–</b></span>
+    </div>
+    <div class="spacer"></div>
+    <button id="pause" type="button">Pause</button>
+  </header>
+
+  <div id="error" class="err"></div>
+
+  <section class="tiles">
+    <div class="tile"><div class="k">Geräte in Reichweite</div><div class="v" id="t-total">–</div><div class="s" id="t-total-s">&nbsp;</div></div>
+    <div class="tile"><div class="k">BLE</div><div class="v" id="t-ble">–</div><div class="s">Bluetooth Low Energy</div></div>
+    <div class="tile"><div class="k">Classic</div><div class="v" id="t-classic">–</div><div class="s">inkl. Dual-Mode</div></div>
+    <div class="tile"><div class="k">Mit Namen</div><div class="v" id="t-named">–</div><div class="s" id="t-named-s">&nbsp;</div></div>
+    <div class="tile"><div class="k">Stärkstes Signal</div><div class="v" id="t-best">–</div><div class="s" id="t-best-s">&nbsp;</div></div>
+  </section>
+
+  <div class="toolbar">
+    <input class="search" id="q" type="search" placeholder="Suchen: Name, MAC, Hersteller, Details …" autocomplete="off">
+    <div class="seg" id="seg">
+      <button type="button" data-f="all" class="active">Alle</button>
+      <button type="button" data-f="ble">BLE</button>
+      <button type="button" data-f="classic">Classic</button>
+    </div>
+    <div class="range">Signal ab <input id="minrssi" type="range" min="-100" max="-30" step="5" value="-100"><output id="minrssi-o">alle</output></div>
+    <label class="chk"><input id="named" type="checkbox"> nur mit Namen</label>
+    <label class="chk"><input id="fresh" type="checkbox"> nur aktuell (&lt; 15 s)</label>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th data-k="rssi" class="sorted">Signal</th>
+          <th data-k="name">Name</th>
+          <th data-k="mac">MAC</th>
+          <th data-k="vendor" class="c-vendor">Hersteller</th>
+          <th data-k="kind" class="c-kind">Art</th>
+          <th data-k="transport">Typ</th>
+          <th data-k="age">Zuletzt</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" class="empty" hidden>Noch keine Geräte gefunden – die Suche läuft.</div>
+  </div>
+  <footer id="foot"></footer>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const state = { filter: "all", sort: "rssi", asc: false, q: "", minRssi: -100, named: false, fresh: false, paused: false };
+  const open = new Set();
+  const history = new Map();   // MAC -> [[zeit, rssi], ...]
+  let data = { status: {}, devices: [] };
+  let failures = 0;
+
+  try { Object.assign(state, JSON.parse(localStorage.getItem("btscan") || "{}"), { paused: false }); } catch (e) {}
+  const save = () => { try { localStorage.setItem("btscan", JSON.stringify(state)); } catch (e) {} };
+
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const level = r => r == null ? 0 : Math.max(0, Math.min(5, Math.floor((r + 100) / 10)));
+  const cls = r => r == null ? "" : r >= -60 ? "good" : r >= -80 ? "mid" : "bad";
+  const kindOf = t => t.startsWith("Dual") ? "dual" : t.startsWith("Classic") ? "classic" : t === "BLE" ? "ble" : "";
+  const shortT = t => ({ dual: "Dual", classic: "Classic", ble: "BLE" }[kindOf(t)] || "?");
+  const dur = s => { s = Math.round(s); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    return h ? `${h}:${String(m).padStart(2, "0")}:${String(x).padStart(2, "0")}` : `${m}:${String(x).padStart(2, "0")}`; };
+  const ago = s => s < 2 ? "jetzt" : s < 60 ? `vor ${Math.round(s)} s` : `vor ${Math.round(s / 60)} min`;
+
+  function bars(r) {
+    const n = level(r);
+    return `<span class="bars ${cls(r)}">${[1,2,3,4,5].map(i => `<i class="${i <= n ? "on" : ""}"></i>`).join("")}</span>`;
+  }
+
+  function visible() {
+    const q = state.q.trim().toLowerCase();
+    let list = data.devices.filter(d => {
+      const k = kindOf(d.transport);
+      if (state.filter === "ble" && !(k === "ble" || k === "dual")) return false;
+      if (state.filter === "classic" && !(k === "classic" || k === "dual")) return false;
+      if (state.minRssi > -100 && (d.rssi == null || d.rssi < state.minRssi)) return false;
+      if (state.named && !d.name) return false;
+      if (state.fresh && d.age > 15) return false;
+      if (q) {
+        const hay = [d.name, d.mac, d.vendor, d.kind, d.transport, ...(d.details || [])].join(" ").toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    const k = state.sort, dir = state.asc ? 1 : -1;
+    list.sort((a, b) => {
+      let x = a[k], y = b[k];
+      if (k === "rssi") { x = x ?? -999; y = y ?? -999; }
+      if (typeof x === "string" || typeof y === "string") {
+        x = (x || "￿").toLowerCase(); y = (y || "￿").toLowerCase();
+        return x < y ? -dir : x > y ? dir : 0;
+      }
+      return ((x ?? 0) - (y ?? 0)) * dir;
+    });
+    return list;
+  }
+
+  function sparkline(mac) {
+    const h = history.get(mac) || [];
+    if (h.length < 2) return `<div class="legend"><span>Verlauf wird gesammelt …</span></div>`;
+    const W = 280, H = 90, t0 = h[0][0], t1 = h[h.length - 1][0] || t0 + 1;
+    const lo = -100, hi = -30;
+    const pts = h.map(([t, r]) => [((t - t0) / Math.max(1, t1 - t0)) * (W - 8) + 4,
+      H - 6 - ((Math.max(lo, Math.min(hi, r)) - lo) / (hi - lo)) * (H - 12)]);
+    const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
+    const area = `${line}L${pts[pts.length - 1][0].toFixed(1)},${H}L${pts[0][0].toFixed(1)},${H}Z`;
+    const rs = h.map(x => x[1]);
+    const last = pts[pts.length - 1];
+    return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="Signalverlauf">
+        <path d="${area}" fill="var(--accent)" opacity=".12"/>
+        <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.8" vector-effect="non-scaling-stroke"/>
+        <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)"/>
+      </svg>
+      <div class="legend"><span>min ${Math.min(...rs)} dBm</span><span>max ${Math.max(...rs)} dBm</span><span>${dur((t1 - t0) / 1000)}</span></div>`;
+  }
+
+  function details(d) {
+    const rows = (d.details || []).flatMap(line => {
+      const i = line.indexOf(": ");
+      if (i < 0) return [[line, ""]];
+      const k = line.slice(0, i), v = line.slice(i + 2);
+      if (k.startsWith("Typ") && v.includes("  |  Adresse: ")) {
+        const [t, a] = v.split("  |  Adresse: ");
+        return [["Typ", t], ["Adresse", a]];
+      }
+      return [[k, v]];
+    });
+    const dl = rows.map(([k, v]) => {
+      const raw = k.startsWith("Rohdaten");
+      return `<dt>${esc(raw ? k.replace("Rohdaten ", "Roh: ") : k)}</dt><dd class="${raw ? "raw" : ""}">${esc(v.replaceAll("  |  ", " · "))}</dd>`;
+    }).join("");
+    return `<div class="det"><dl>${dl}</dl><div class="spark"><h4>Signalverlauf</h4>${sparkline(d.mac)}</div></div>`;
+  }
+
+  function render() {
+    const s = data.status || {};
+    const all = data.devices;
+    $("adapter").textContent = s.adapter ? `${s.adapter}${s.adapter_address ? " (" + s.adapter_address + ")" : ""}` : "–";
+    $("uptime").textContent = s.uptime != null ? dur(s.uptime) : "–";
+    $("stamp").textContent = s.timestamp ? s.timestamp.slice(11) : "–";
+    $("state").textContent = state.paused ? "pausiert" : s.discovering ? "Suche läuft" : "Suche startet …";
+    $("dot").className = "dot" + (state.paused ? "" : s.discovering ? " on" : "");
+
+    const ble = all.filter(d => ["ble", "dual"].includes(kindOf(d.transport))).length;
+    const classic = all.filter(d => ["classic", "dual"].includes(kindOf(d.transport))).length;
+    const named = all.filter(d => d.name).length;
+    const best = all.filter(d => d.rssi != null).sort((a, b) => b.rssi - a.rssi)[0];
+    $("t-total").textContent = all.length;
+    $("t-total-s").textContent = `gesehen in den letzten ${s.timeout ?? "?"} s`;
+    $("t-ble").textContent = ble;
+    $("t-classic").textContent = classic;
+    $("t-named").textContent = named;
+    $("t-named-s").textContent = all.length ? `${Math.round(named / all.length * 100)} % aller Geräte` : " ";
+    $("t-best").textContent = best ? `${best.rssi} dBm` : "–";
+    $("t-best-s").textContent = best ? (best.name || best.mac) : " ";
+
+    document.querySelectorAll("th[data-k]").forEach(th => {
+      th.classList.toggle("sorted", th.dataset.k === state.sort);
+      th.classList.toggle("asc", th.dataset.k === state.sort && state.asc);
+    });
+
+    const list = visible();
+    $("empty").hidden = list.length > 0;
+    $("empty").textContent = all.length ? "Keine Geräte passen zum Filter." : "Noch keine Geräte gefunden – die Suche läuft.";
+    $("rows").innerHTML = list.map(d => {
+      const k = kindOf(d.transport);
+      const st = (d.connected ? `<span class="badge st">verbunden</span>` : "") + (d.paired ? `<span class="badge st">gekoppelt</span>` : "");
+      const main = `<tr class="row${open.has(d.mac) ? " open" : ""}${d.age > 30 ? " stale" : ""}" data-mac="${esc(d.mac)}">
+          <td class="sigc"><span class="sig">${bars(d.rssi)}<span>${d.rssi ?? "–"} dBm</span></span></td>
+          <td class="name" title="${esc(d.name || "")}">${d.name ? esc(d.name) : `<span class="unk">unbekannt</span>`}${st}</td>
+          <td class="mac">${esc(d.mac)}</td>
+          <td class="vendor" title="${esc(d.vendor || "")}">${esc(d.vendor || "–")}</td>
+          <td class="kind" title="${esc(d.kind || "")}">${esc(d.kind || "–")}</td>
+          <td class="type"><span class="badge ${k}">${shortT(d.transport)}</span></td>
+          <td class="age">${ago(d.age)}</td>
+        </tr>`;
+      return open.has(d.mac) ? main + `<tr class="detail"><td colspan="7">${details(d)}</td></tr>` : main;
+    }).join("");
+
+    const db = (s.databases || []).join(", ");
+    $("foot").textContent = `${list.length} von ${all.length} angezeigt · ${s.known_devices ?? 0} Geräte seit Start bekannt` +
+      (s.deep ? " · GATT-Abfrage aktiv" : "") + (db ? ` · Datenbanken: ${db}` : " · keine Hersteller-Datenbank geladen (--update-db)");
+  }
+
+  async function poll() {
+    if (!state.paused) {
+      try {
+        const r = await fetch("api/devices", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        data = await r.json();
+        const now = Date.now();
+        for (const d of data.devices) {
+          if (d.rssi == null) continue;
+          const h = history.get(d.mac) || [];
+          h.push([now, d.rssi]);
+          while (h.length && now - h[0][0] > 10 * 60 * 1000) h.shift();
+          history.set(d.mac, h);
+        }
+        failures = 0;
+        $("error").style.display = "none";
+        render();
+      } catch (e) {
+        failures++;
+        if (failures > 1) {
+          $("error").textContent = `Keine Verbindung zum Scanner (${e.message}). Läuft bt_scan.py noch?`;
+          $("error").style.display = "block";
+          $("dot").className = "dot err";
+          $("state").textContent = "getrennt";
+        }
+      }
+    }
+    setTimeout(poll, 1000);
+  }
+
+  // Bedienelemente
+  $("q").value = state.q;
+  $("q").addEventListener("input", e => { state.q = e.target.value; save(); render(); });
+  document.querySelectorAll("#seg button").forEach(b => {
+    b.classList.toggle("active", b.dataset.f === state.filter);
+    b.addEventListener("click", () => {
+      state.filter = b.dataset.f; save();
+      document.querySelectorAll("#seg button").forEach(x => x.classList.toggle("active", x === b));
+      render();
+    });
+  });
+  const rssiLabel = () => { $("minrssi-o").textContent = state.minRssi > -100 ? `${state.minRssi} dBm` : "alle"; };
+  $("minrssi").value = state.minRssi; rssiLabel();
+  $("minrssi").addEventListener("input", e => { state.minRssi = +e.target.value; rssiLabel(); save(); render(); });
+  $("named").checked = state.named;
+  $("named").addEventListener("change", e => { state.named = e.target.checked; save(); render(); });
+  $("fresh").checked = state.fresh;
+  $("fresh").addEventListener("change", e => { state.fresh = e.target.checked; save(); render(); });
+  document.querySelectorAll("th[data-k]").forEach(th => th.addEventListener("click", () => {
+    const k = th.dataset.k;
+    if (state.sort === k) state.asc = !state.asc;
+    else { state.sort = k; state.asc = ["name", "mac", "vendor", "kind", "transport", "age"].includes(k); }
+    save(); render();
+  }));
+  $("rows").addEventListener("click", e => {
+    const tr = e.target.closest("tr.row");
+    if (!tr || window.getSelection().toString()) return;
+    const mac = tr.dataset.mac;
+    open.has(mac) ? open.delete(mac) : open.add(mac);
+    render();
+  });
+  $("pause").addEventListener("click", () => {
+    state.paused = !state.paused;
+    $("pause").textContent = state.paused ? "Fortsetzen" : "Pause";
+    render();
+  });
+
+  poll();
+})();
+</script>
+</body>
+</html>

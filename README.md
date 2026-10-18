@@ -53,6 +53,27 @@ Hersteller-Datenbanken nach `data/` (IEEE OUI, Bluetooth-SIG-Firmen-IDs und UUID
 lassen sich jederzeit mit `--update-db` aktualisieren. Ohne sie läuft der Scanner auch, kennt dann
 aber nur eine kleine eingebaute Herstellerliste.
 
+## Weboberfläche
+
+```bash
+.venv/bin/python bt_scan.py --web 8080            # Terminal-Ansicht + Weboberfläche
+.venv/bin/python bt_scan.py --web 8080 -m none    # nur Weboberfläche
+```
+
+Dann im Browser `http://<IP-des-Containers>:8080/` öffnen. Die Seite aktualisiert sich jede Sekunde und zeigt:
+
+- Kacheln: Geräte in Reichweite, Anzahl BLE und Classic, Geräte mit Namen, stärkstes Signal
+- eine Tabelle mit Signal, Name, MAC, Hersteller, Geräteart, Typ und letzter Sichtung; ein Klick auf
+  eine Spalte sortiert danach
+- Suche (auch in den Details), Filter BLE/Classic, Mindestsignal, „nur mit Namen“, „nur aktuell“
+- ein Klick auf ein Gerät klappt alle Details und den Signalverlauf der letzten 10 Minuten auf
+- helles und dunkles Design, auch für das Handy geeignet; Pause-Knopf
+
+Die Seite braucht kein Internet. Die Rohdaten gibt es unter `/api/devices` als JSON, z. B. für
+Home Assistant oder Node-RED. Ohne Anmeldung kann jeder im Netz die Seite öffnen. Mit
+`--web-auth benutzer:passwort` wird ein Passwort abgefragt; mit `--web 127.0.0.1:8080` ist die Seite
+nur lokal erreichbar.
+
 ## Benutzung
 
 ```bash
@@ -67,7 +88,9 @@ aber nur eine kleine eingebaute Herstellerliste.
 | Option | Bedeutung |
 |---|---|
 | `-a hci0` | Adapter wählen (Name oder MAC) |
-| `-m live\|log` | Live-Bildschirm (Standard) oder fortlaufende Zeilen |
+| `-m live\|log\|none` | Live-Bildschirm (Standard), fortlaufende Zeilen oder keine Terminalausgabe |
+| `-w [HOST:]PORT`, `--web` | Weboberfläche starten, z. B. `--web 8080` |
+| `--web-auth user:pass` | Weboberfläche mit Passwort schützen |
 | `-t auto\|le\|bredr` | Classic + BLE (Standard), nur BLE oder nur Classic |
 | `-i 1` | Aktualisierungsintervall in Sekunden |
 | `--timeout 120` | Geräte ausblenden, die so viele Sekunden nicht gesehen wurden |
@@ -154,7 +177,7 @@ After=bluetooth.service
 Requires=bluetooth.service
 
 [Service]
-ExecStart=/opt/scan_bluetooth/.venv/bin/python /opt/scan_bluetooth/bt_scan.py -m log -j /run/bt_scan.json
+ExecStart=/opt/scan_bluetooth/.venv/bin/python /opt/scan_bluetooth/bt_scan.py -m none --web 8080
 Restart=always
 
 [Install]
