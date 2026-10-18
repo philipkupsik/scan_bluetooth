@@ -21,6 +21,7 @@ import json
 import os
 import re
 import signal
+import socket as socket_mod
 import struct
 import sys
 import time
@@ -559,11 +560,16 @@ class Device:
         self.rssi_max = None
         self.rssi_sum = 0
         self.rssi_count = 0
+        self.rssi_time = 0.0
         self.gatt = {}
         self.gatt_state = None  # None, "laeuft", "ok", "fehlgeschlagen: ..."
         self.gatt_tries = 0
         self.gatt_last_try = 0.0
         self.last_logged = 0.0
+        self.in_bluez = False      # BlueZ kennt das Geraet (noetig fuer --deep)
+        self.via_hci = False       # Geraet wurde (auch) direkt per HCI empfangen
+        self.probe_ok = 0.0        # letzte erfolgreiche Namensabfrage
+        self.probe_fail = 0.0      # letzte erfolglose Namensabfrage
 
     def update(self, props, seen=True):
         self.props.update(props)
@@ -573,6 +579,7 @@ class Device:
             self.rssi_max = rssi if self.rssi_max is None else max(self.rssi_max, rssi)
             self.rssi_sum += rssi
             self.rssi_count += 1
+            self.rssi_time = time.time()
         if seen:
             self.last_seen = time.time()
             self.updates += 1
@@ -597,13 +604,13 @@ class Device:
     @property
     def is_le(self):
         p = self.props
-        return bool(p.get("AddressType") == "random" or p.get("AdvertisingFlags")
+        return bool(p.get("LE") or p.get("AddressType") == "random" or p.get("AdvertisingFlags")
                     or p.get("ManufacturerData") or p.get("ServiceData")
                     or "Appearance" in p or "TxPower" in p)
 
     @property
     def is_classic(self):
-        return "Class" in self.props
+        return "Class" in self.props or bool(self.props.get("BREDR"))
 
     @property
     def transport(self):
@@ -614,6 +621,183 @@ class Device:
         if self.is_le:
             return "BLE"
         return "unbekannt"
+
+
+# --------------------------------------------------------------------------
+# Direkter HCI-Zugriff: rohe Funkpakete mitlesen (Monitor) und Namensabfragen
+# --------------------------------------------------------------------------
+
+AF_BLUETOOTH = 31
+BTPROTO_HCI = 1
+HCI_DEV_NONE = 0xFFFF
+HCI_CHANNEL_RAW = 0
+HCI_CHANNEL_MONITOR = 2
+HCI_MON_EVENT_PKT = 3
+BT_BASE_UUID = "-0000-1000-8000-00805f9b34fb"
+
+
+def open_hci_socket(dev, channel):
+    """Oeffnet einen HCI-Socket per libc (Pythons socket-Modul kennt keine HCI-Kanaele)."""
+    import ctypes
+    import fcntl
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.socket(AF_BLUETOOTH, socket_mod.SOCK_RAW | socket_mod.SOCK_CLOEXEC, BTPROTO_HCI)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    addr = struct.pack("<HHH", AF_BLUETOOTH, dev, channel)
+    if libc.bind(fd, ctypes.c_char_p(addr), len(addr)) < 0:
+        err = ctypes.get_errno()
+        os.close(fd)
+        raise OSError(err, os.strerror(err))
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+    return fd
+
+
+def bdaddr_str(raw):
+    return ":".join(f"{b:02X}" for b in reversed(raw))
+
+
+def uuid16_str(v):
+    return f"0000{v:04x}{BT_BASE_UUID}"
+
+
+def uuid32_str(v):
+    return f"{v:08x}{BT_BASE_UUID}"
+
+
+def uuid128_str(raw):
+    return str(uuidlib.UUID(bytes=bytes(reversed(raw))))
+
+
+def parse_ad(data):
+    """Wertet Advertising-/EIR-Daten aus und liefert Eigenschaften im BlueZ-Format."""
+    props = {}
+    uuids = []
+    mdata = {}
+    sdata = {}
+    i = 0
+    while i < len(data):
+        length = data[i]
+        if length == 0 or i + 1 + length > len(data):
+            break
+        typ = data[i + 1]
+        val = data[i + 2:i + 1 + length]
+        i += 1 + length
+        if typ == 0x01 and val:
+            props["AdvertisingFlags"] = bytes(val[:1])
+        elif typ in (0x02, 0x03):
+            uuids += [uuid16_str(struct.unpack_from("<H", val, j)[0]) for j in range(0, len(val) - 1, 2)]
+        elif typ in (0x04, 0x05):
+            uuids += [uuid32_str(struct.unpack_from("<I", val, j)[0]) for j in range(0, len(val) - 3, 4)]
+        elif typ in (0x06, 0x07):
+            uuids += [uuid128_str(val[j:j + 16]) for j in range(0, len(val) - 15, 16)]
+        elif typ in (0x08, 0x09):
+            name = bytes(val).split(b"\x00")[0].decode("utf-8", "replace").strip()
+            if name and (typ == 0x09 or "Name" not in props):
+                props["Name"] = name
+        elif typ == 0x0A and val:
+            props["TxPower"] = struct.unpack("b", val[:1])[0]
+        elif typ == 0x0D and len(val) >= 3:
+            props["Class"] = int.from_bytes(val[:3], "little")
+        elif typ == 0x16 and len(val) >= 2:
+            sdata[uuid16_str(struct.unpack_from("<H", val)[0])] = bytes(val[2:])
+        elif typ == 0x20 and len(val) >= 4:
+            sdata[uuid32_str(struct.unpack_from("<I", val)[0])] = bytes(val[4:])
+        elif typ == 0x21 and len(val) >= 16:
+            sdata[uuid128_str(val[:16])] = bytes(val[16:])
+        elif typ == 0x19 and len(val) >= 2:
+            props["Appearance"] = struct.unpack_from("<H", val)[0]
+        elif typ == 0xFF and len(val) >= 2:
+            mdata[struct.unpack_from("<H", val)[0]] = bytes(val[2:])
+    if uuids:
+        props["UUIDs"] = uuids
+    if mdata:
+        props["ManufacturerData"] = mdata
+    if sdata:
+        props["ServiceData"] = sdata
+    return props
+
+
+def parse_hci_event(evt, p):
+    """Liefert eine Liste von (adresse, eigenschaften) aus einem HCI-Event."""
+    out = []
+    try:
+        if evt == 0x3E and p:                       # LE Meta Event
+            sub = p[0]
+            if sub == 0x02:                         # LE Advertising Report
+                n, i = p[1], 2
+                for _ in range(n):
+                    etype, atype = p[i], p[i + 1]
+                    addr = bdaddr_str(p[i + 2:i + 8])
+                    dlen = p[i + 8]
+                    data = p[i + 9:i + 9 + dlen]
+                    rssi = struct.unpack("b", p[i + 9 + dlen:i + 10 + dlen])[0]
+                    i += 10 + dlen
+                    props = parse_ad(data)
+                    props["AddressType"] = "random" if atype in (1, 3) else "public"
+                    if etype != 0x04:               # Scan Response sagt nichts ueber Verbindbarkeit
+                        props["Connectable"] = etype in (0x00, 0x01)
+                    if rssi != 127:
+                        props["RSSI"] = rssi
+                    props["LE"] = True
+                    out.append((addr, props))
+            elif sub == 0x0D:                       # LE Extended Advertising Report
+                n, i = p[1], 2
+                for _ in range(n):
+                    etype = struct.unpack_from("<H", p, i)[0]
+                    atype = p[i + 2]
+                    addr = bdaddr_str(p[i + 3:i + 9])
+                    tx = struct.unpack("b", p[i + 12:i + 13])[0]
+                    rssi = struct.unpack("b", p[i + 13:i + 14])[0]
+                    dlen = p[i + 23]
+                    data = p[i + 24:i + 24 + dlen]
+                    i += 24 + dlen
+                    if atype == 0xFF:               # anonyme Werbung ohne Adresse
+                        continue
+                    props = parse_ad(data)
+                    props["AddressType"] = "random" if atype in (1, 3) else "public"
+                    if not etype & 0x08:
+                        props["Connectable"] = bool(etype & 0x01)
+                    if rssi != 127:
+                        props["RSSI"] = rssi
+                    if tx != 127 and "TxPower" not in props:
+                        props["TxPower"] = tx
+                    props["LE"] = True
+                    out.append((addr, props))
+        elif evt == 0x2F and len(p) >= 15:          # Extended Inquiry Result
+            props = parse_ad(p[15:])
+            props["Class"] = int.from_bytes(p[9:12], "little")
+            rssi = struct.unpack("b", p[14:15])[0]
+            if rssi != 127:
+                props["RSSI"] = rssi
+            props["AddressType"] = "public"
+            out.append((bdaddr_str(p[1:7]), props))
+        elif evt == 0x22 and p:                     # Inquiry Result with RSSI
+            for k in range(p[0]):
+                r = p[1 + k * 14:1 + (k + 1) * 14]
+                if len(r) < 14:
+                    break
+                out.append((bdaddr_str(r[0:6]), {"Class": int.from_bytes(r[8:11], "little"),
+                                                 "RSSI": struct.unpack("b", r[13:14])[0],
+                                                 "AddressType": "public"}))
+        elif evt == 0x02 and p:                     # Inquiry Result (ohne RSSI)
+            for k in range(p[0]):
+                r = p[1 + k * 14:1 + (k + 1) * 14]
+                if len(r) < 14:
+                    break
+                out.append((bdaddr_str(r[0:6]), {"Class": int.from_bytes(r[9:12], "little"),
+                                                 "AddressType": "public"}))
+        elif evt == 0x07 and len(p) >= 7:           # Remote Name Request Complete
+            props = {"_probe_status": p[0]}
+            if p[0] == 0:
+                name = bytes(p[7:]).split(b"\x00")[0].decode("utf-8", "replace").strip()
+                if name:
+                    props["Name"] = name
+            out.append((bdaddr_str(p[1:7]), props))
+    except (IndexError, struct.error):
+        pass
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -663,6 +847,12 @@ class Scanner:
         self.started = time.time()
         self.discovery_restarts = 0
         self.stop_event = asyncio.Event()
+        self.hci_index = None
+        self.hci_mon_fd = None
+        self.hci_state = "aus"
+        self.hci_packets = 0
+        self.probe_waiters = {}
+        self.probe_state = "aus"
 
     async def call(self, path, interface, member, signature="", body=None, destination=BLUEZ):
         reply = await self.bus.call(Message(destination=destination, path=path, interface=interface,
@@ -725,6 +915,7 @@ class Scanner:
         for path, ifaces in objs.items():
             if IFACE_DEVICE in ifaces and path.startswith(self.adapter_path + "/"):
                 dev = self.devices.setdefault(path, Device(path))
+                dev.in_bluez = True
                 dev.update(ifaces[IFACE_DEVICE], seen="RSSI" in ifaces[IFACE_DEVICE])
 
         filt = {"Transport": Variant("s", self.args.transport), "DuplicateData": Variant("b", True)}
@@ -794,8 +985,13 @@ class Scanner:
                 if IFACE_DEVICE in ifaces and path.startswith(self.adapter_path + "/"):
                     props = ifaces[IFACE_DEVICE]
                     dev = self.devices.setdefault(path, Device(path))
+                    dev.in_bluez = True
                     dev.update(props, seen="RSSI" in props or "ManufacturerData" in props)
                     self.log_device(dev, new=dev.updates <= 1)
+            elif msg.member == "InterfacesRemoved":
+                path, ifaces = msg.body[0], msg.body[1]
+                if IFACE_DEVICE in ifaces and path in self.devices:
+                    self.devices[path].in_bluez = False
             elif msg.member == "PropertiesChanged":
                 iface, changed = msg.body[0], unwrap(msg.body[1])
                 path = msg.path
@@ -804,6 +1000,7 @@ class Scanner:
                     is_new = dev is None
                     if is_new:
                         dev = self.devices[path] = Device(path)
+                    dev.in_bluez = True
                     seen = any(k in changed for k in ("RSSI", "ManufacturerData", "ServiceData", "TxPower", "Name"))
                     dev.update(changed, seen=seen)
                     if seen:
@@ -840,6 +1037,124 @@ class Scanner:
             except DBusError:
                 pass
 
+    # ---------------- Direkter HCI-Empfang ----------------------------------
+
+    def start_hci_monitor(self):
+        """Liest alle Funkpakete mit, die der Dongle empfaengt - auch die, die BlueZ verwirft."""
+        if self.args.no_hci:
+            return
+        m = re.search(r"hci(\d+)$", self.adapter_path)
+        if not m:
+            return
+        self.hci_index = int(m.group(1))
+        try:
+            self.hci_mon_fd = open_hci_socket(HCI_DEV_NONE, HCI_CHANNEL_MONITOR)
+        except OSError as e:
+            self.hci_state = f"nicht verfuegbar ({e.strerror})"
+            print(f"Hinweis: Direkter HCI-Empfang nicht moeglich ({e.strerror}) - es werden nur Geraete "
+                  "angezeigt, die BlueZ meldet. Benoetigt root bzw. CAP_NET_RAW.", file=sys.stderr)
+            return
+        asyncio.get_running_loop().add_reader(self.hci_mon_fd, self.on_hci)
+        self.hci_state = "aktiv"
+
+    def on_hci(self):
+        while True:
+            try:
+                pkt = os.read(self.hci_mon_fd, 4096)
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+            if len(pkt) < 8:
+                continue
+            opcode, index, _ = struct.unpack_from("<HHH", pkt)
+            if opcode != HCI_MON_EVENT_PKT or index != self.hci_index:
+                continue
+            evt, plen = pkt[6], pkt[7]
+            for addr, props in parse_hci_event(evt, pkt[8:8 + plen]):
+                self.hci_packets += 1
+                self.ingest_hci(addr, props)
+
+    def ingest_hci(self, addr, props):
+        path = f"{self.adapter_path}/dev_{addr.replace(':', '_')}"
+        dev = self.devices.get(path)
+        is_new = dev is None or not dev.last_seen
+        if dev is None:
+            dev = self.devices[path] = Device(path)
+        dev.via_hci = True
+        props["Address"] = addr
+        old = dev.props
+        if "UUIDs" in props:
+            props["UUIDs"] = list(dict.fromkeys((old.get("UUIDs") or []) + props["UUIDs"]))
+        for key in ("ManufacturerData", "ServiceData"):
+            if key in props and old.get(key):
+                props[key] = {**old[key], **props[key]}
+        if "AddressType" in props and old.get("AddressType") and not props.get("LE"):
+            del props["AddressType"]
+        seen = "RSSI" in props
+        status = props.pop("_probe_status", None)
+        if status is not None:
+            props["BREDR"] = True
+            if status == 0:
+                dev.probe_ok = time.time()
+                seen = True
+            else:
+                dev.probe_fail = time.time()
+            waiter = self.probe_waiters.pop(addr, None)
+            if waiter and not waiter.done():
+                waiter.set_result(status)
+        dev.update(props, seen=seen)
+        if seen:
+            self.log_device(dev, new=is_new)
+
+    # ---------------- Anwesenheitspruefung bekannter Classic-Geraete --------
+
+    def probe_targets(self):
+        targets = {m.upper() for m in self.args.probe}
+        for d in self.devices.values():
+            if d.props.get("AddressType", "public") != "public":
+                continue
+            if d.props.get("Paired") or d.props.get("Bonded") or d.is_classic:
+                targets.add(d.address.upper())
+        return sorted(targets)
+
+    async def probe_worker(self):
+        """Fragt bekannte Classic-Geraete per 'Remote Name Request' ab.
+        Das funktioniert auch, wenn das Geraet nicht sichtbar (nicht im Kopplungsmodus) ist."""
+        if self.hci_mon_fd is None:
+            self.probe_state = "nicht moeglich (kein HCI-Empfang)"
+            return
+        try:
+            fd = open_hci_socket(self.hci_index, HCI_CHANNEL_RAW)
+        except OSError as e:
+            self.probe_state = f"nicht moeglich ({e.strerror})"
+            return
+        self.probe_state = "aktiv"
+        loop = asyncio.get_running_loop()
+        try:
+            while not self.stop_event.is_set():
+                for addr in self.probe_targets():
+                    if self.stop_event.is_set():
+                        break
+                    dev = self.devices.get(f"{self.adapter_path}/dev_{addr.replace(':', '_')}")
+                    if dev and time.time() - dev.last_seen < self.args.probe_interval / 2:
+                        continue        # gerade erst gesehen, Abfrage unnoetig
+                    if dev and dev.props.get("Connected"):
+                        continue
+                    bd = bytes(reversed(bytes.fromhex(addr.replace(":", ""))))
+                    cmd = b"\x01" + struct.pack("<HB", 0x0419, 10) + bd + b"\x02\x00\x00\x00"
+                    fut = loop.create_future()
+                    self.probe_waiters[addr] = fut
+                    try:
+                        os.write(fd, cmd)
+                        await asyncio.wait_for(fut, timeout=12)
+                    except (asyncio.TimeoutError, OSError):
+                        self.probe_waiters.pop(addr, None)
+                    await asyncio.sleep(0.5)
+                await asyncio.sleep(self.args.probe_interval)
+        finally:
+            os.close(fd)
+
     # ---------------- GATT-Abfrage (Device Information Service) -------------
 
     async def gatt_worker(self):
@@ -847,7 +1162,8 @@ class Scanner:
             await asyncio.sleep(1)
             now = time.time()
             candidates = [d for d in self.devices.values()
-                          if d.is_le and not d.is_classic
+                          if d.is_le and not d.is_classic and d.in_bluez
+                          and d.props.get("Connectable", True)
                           and d.gatt_state not in ("ok", "keine Geraeteinfos lesbar")
                           and d.gatt_tries < 3 and now - d.gatt_last_try > 300
                           and now - d.last_seen < 10
@@ -966,6 +1282,10 @@ class Scanner:
                 "details": device_details(d, self.db),
                 "gatt": d.gatt,
                 "gatt_state": d.gatt_state,
+                "connectable": d.props.get("Connectable"),
+                "hidden": not d.in_bluez,
+                "probe_ok": d.probe_ok or None,
+                "probe_only": d.probe_ok > d.rssi_time + 30,
             })
         return out
 
@@ -978,6 +1298,8 @@ class Scanner:
             "deep": self.args.deep, "timeout": self.args.timeout,
             "uptime": round(time.time() - self.started), "known_devices": len(self.devices),
             "databases": self.db.sources,
+            "hci": self.hci_state, "hci_packets": self.hci_packets,
+            "probe": self.probe_state if self.args.probe is not None else None,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 
@@ -1055,7 +1377,10 @@ class Scanner:
     async def run(self):
         await self.setup()
         server = await self.start_web() if self.args.web else None
+        self.start_hci_monitor()
         tasks = [asyncio.create_task(self.watchdog()), asyncio.create_task(self.display_loop())]
+        if self.args.probe is not None:
+            tasks.append(asyncio.create_task(self.probe_worker()))
         if self.args.deep:
             tasks.append(asyncio.create_task(self.gatt_worker()))
         try:
@@ -1070,6 +1395,9 @@ class Scanner:
                 t.cancel()
             if server:
                 server.close()
+            if self.hci_mon_fd is not None:
+                asyncio.get_running_loop().remove_reader(self.hci_mon_fd)
+                os.close(self.hci_mon_fd)
             await self.stop_discovery()
         if self.args.once:
             if self.args.json:
@@ -1106,6 +1434,9 @@ def format_main_line(d, color):
     rssi = d.rssi
     bar, quality = signal_bar(rssi)
     sig = f"{rssi} dBm {bar} {quality}" if rssi is not None else "kein aktuelles Signal"
+    if d.probe_ok > d.rssi_time + 30:
+        sig = "erreichbar per Namensabfrage (nicht sichtbar, kein Funkpegel)"
+        rssi = None
     if color and rssi is not None:
         code = "32" if rssi >= -60 else "33" if rssi >= -80 else "31"
         sig = c(sig, code, True)
@@ -1221,6 +1552,24 @@ def device_details(d, db):
     if status:
         det.append("Status: " + ", ".join(status))
 
+    if d.is_le and ("Connectable" in p or "AdvertisingFlags" in p):
+        adv = []
+        if "Connectable" in p:
+            adv.append("verbindbar" if p["Connectable"] else "nicht verbindbar (reiner Sender/Beacon)")
+        flags = p.get("AdvertisingFlags")
+        if flags is not None:
+            adv.append("meldet sich als sichtbar" if flags and flags[0] & 0x03 else "meldet sich NICHT als sichtbar")
+        else:
+            adv.append("ohne Sichtbarkeits-Flag")
+        det.append("Funkbetrieb: " + ", ".join(adv))
+    if d.via_hci and not d.in_bluez:
+        det.append("Quelle: nur direkt per HCI empfangen (von BlueZ nicht gemeldet)")
+    if d.probe_ok or d.probe_fail:
+        if d.probe_ok >= d.probe_fail:
+            det.append(f"Anwesenheit: antwortet auf Namensabfrage (zuletzt {time.strftime('%H:%M:%S', time.localtime(d.probe_ok))})")
+        else:
+            det.append(f"Anwesenheit: keine Antwort auf Namensabfrage ({time.strftime('%H:%M:%S', time.localtime(d.probe_fail))})")
+
     det.append(f"Gesehen: zuerst {time.strftime('%H:%M:%S', time.localtime(d.first_seen))}, "
                f"zuletzt {time.strftime('%H:%M:%S', time.localtime(d.last_seen))}, {d.updates} Updates")
 
@@ -1270,6 +1619,12 @@ def parse_args():
     ap.add_argument("--once", type=float, metavar="SEK", help="X Sekunden scannen, Ergebnis ausgeben, beenden")
     ap.add_argument("--update-db", action="store_true",
                     help="Hersteller-Datenbanken (IEEE OUI, Bluetooth SIG) herunterladen und beenden")
+    ap.add_argument("-p", "--probe", nargs="*", metavar="MAC",
+                    help="Anwesenheitspruefung fuer Classic-Geraete, die NICHT sichtbar sind: bekannte/gekoppelte "
+                         "Geraete und die angegebenen MACs werden regelmaessig per Namensabfrage angefunkt")
+    ap.add_argument("--probe-interval", type=float, default=30, help="Abstand der Namensabfragen in s (Standard 30)")
+    ap.add_argument("--no-hci", action="store_true",
+                    help="Keine rohen Funkpakete mitlesen, nur die Geraete anzeigen, die BlueZ meldet")
     ap.add_argument("-w", "--web", metavar="[HOST:]PORT",
                     help="Weboberflaeche starten, z.B. --web 8080 oder --web 127.0.0.1:8080")
     ap.add_argument("--web-auth", metavar="USER:PASSWORT", help="Weboberflaeche mit Passwort schuetzen")

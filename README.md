@@ -101,6 +101,9 @@ nur lokal erreichbar.
 | `-j datei.json` | aktuelle Liste laufend als JSON schreiben (z. B. für Home Assistant/Node-RED) |
 | `--once 30` | 30 s scannen, Ergebnis ausgeben und beenden |
 | `--update-db` | Hersteller-Datenbanken herunterladen |
+| `-p`, `--probe [MAC …]` | Anwesenheitsprüfung für Classic-Geräte, die nicht sichtbar sind (siehe unten) |
+| `--probe-interval 30` | Abstand der Anwesenheitsprüfung in Sekunden |
+| `--no-hci` | keine rohen Funkpakete mitlesen, nur Geräte anzeigen, die BlueZ meldet |
 
 ### So oft wie möglich scannen
 
@@ -109,8 +112,34 @@ nur lokal erreichbar.
 - Ein Watchdog startet die Suche sofort neu, falls sie gestoppt wird, z. B. durch ein anderes Programm.
 - `-t auto` wechselt zwischen BLE-Scan und Classic-Inquiry. Classic-Geräte werden dadurch nur etwa alle
   10 s aktualisiert. Wenn BLE möglichst schnell aktualisiert werden soll, nimm `-t le`.
-- Classic-Geräte tauchen nur auf, wenn sie **sichtbar** sind. Gekoppelte Handys oder Kopfhörer, die
-  nicht im Kopplungsmodus sind, antworten auf keine Suche. Das ist eine Grenze von Bluetooth selbst.
+
+### Auch Geräte, die nicht im Kopplungsmodus sind
+
+**BLE:** Der Scanner liest direkt mit, was der Dongle empfängt (HCI-Monitor, wie `btmon`). So erscheint
+alles, was per BLE sendet: Geräte ohne Sichtbarkeits-Flag, reine Sender wie AirTags, Find-My-Geräte und
+Beacons sowie Extended Advertising. Geräte, die BlueZ selbst nicht gemeldet hätte, tragen in der
+Weboberfläche das Kennzeichen **versteckt**. Dafür sind root-Rechte bzw. `CAP_NET_RAW` nötig. Ohne sie
+gibt der Scanner einen Hinweis aus und zeigt nur, was BlueZ meldet.
+
+Handys senden fast immer auch BLE, iPhones zum Beispiel ständig. Sie erscheinen dann als BLE-Gerät,
+meist ohne Namen und mit einer zufälligen MAC, die sich etwa alle 15 Minuten ändert.
+
+**Classic:** Ein Classic-Gerät, das nicht sichtbar ist, antwortet auf keine Suche. Es sendet auch
+nichts, was ein normaler Dongle unaufgefordert empfangen könnte. Unbekannte Geräte dieser Art lassen
+sich deshalb grundsätzlich nicht finden. Das liegt an Bluetooth selbst, nicht am Skript. **Bekannte**
+Geräte kann man aber gezielt anfunken. Das macht `--probe`:
+
+```bash
+.venv/bin/python bt_scan.py --probe                      # gekoppelte und bereits gesehene Classic-Geräte
+.venv/bin/python bt_scan.py --probe AA:BB:CC:DD:EE:FF    # zusätzlich diese MAC(s)
+```
+
+Die Geräte bekommen nacheinander eine Namensabfrage (*Remote Name Request*). Antwortet ein Gerät, ist
+es in Reichweite und eingeschaltet. In der Liste steht dann **erreichbar** und der Name, auch wenn es
+nicht im Kopplungsmodus ist. Einen Signalpegel liefert diese Abfrage nicht. Die MAC eines Handys
+findest du unter Einstellungen → Über das Telefon → Bluetooth-Adresse. Alternativ koppelst du das Gerät
+einmal mit dem Dongle, dann wird es automatisch abgefragt. Antwortet ein Gerät nicht, dauert die
+Abfrage etwa 5 s. Bei vielen Zielen wird ein Durchgang daher entsprechend länger.
 
 ### Zu `--deep` (Modell, Seriennummer, Firmware)
 
@@ -177,7 +206,7 @@ After=bluetooth.service
 Requires=bluetooth.service
 
 [Service]
-ExecStart=/opt/scan_bluetooth/.venv/bin/python /opt/scan_bluetooth/bt_scan.py -m none --web 8080
+ExecStart=/opt/scan_bluetooth/.venv/bin/python /opt/scan_bluetooth/bt_scan.py -m none --web 8080 --probe
 Restart=always
 
 [Install]

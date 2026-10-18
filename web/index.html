@@ -152,6 +152,7 @@
     <div class="tile"><div class="k">BLE</div><div class="v" id="t-ble">–</div><div class="s">Bluetooth Low Energy</div></div>
     <div class="tile"><div class="k">Classic</div><div class="v" id="t-classic">–</div><div class="s">inkl. Dual-Mode</div></div>
     <div class="tile"><div class="k">Mit Namen</div><div class="v" id="t-named">–</div><div class="s" id="t-named-s">&nbsp;</div></div>
+    <div class="tile"><div class="k">Versteckt</div><div class="v" id="t-hidden">–</div><div class="s">nur per Direktempfang</div></div>
     <div class="tile"><div class="k">Stärkstes Signal</div><div class="v" id="t-best">–</div><div class="s" id="t-best-s">&nbsp;</div></div>
   </section>
 
@@ -297,6 +298,7 @@
     $("t-classic").textContent = classic;
     $("t-named").textContent = named;
     $("t-named-s").textContent = all.length ? `${Math.round(named / all.length * 100)} % aller Geräte` : " ";
+    $("t-hidden").textContent = all.filter(d => d.hidden).length;
     $("t-best").textContent = best ? `${best.rssi} dBm` : "–";
     $("t-best-s").textContent = best ? (best.name || best.mac) : " ";
 
@@ -310,9 +312,14 @@
     $("empty").textContent = all.length ? "Keine Geräte passen zum Filter." : "Noch keine Geräte gefunden – die Suche läuft.";
     $("rows").innerHTML = list.map(d => {
       const k = kindOf(d.transport);
-      const st = (d.connected ? `<span class="badge st">verbunden</span>` : "") + (d.paired ? `<span class="badge st">gekoppelt</span>` : "");
+      const st = (d.connected ? `<span class="badge st">verbunden</span>` : "") + (d.paired ? `<span class="badge st">gekoppelt</span>` : "") +
+        (d.hidden ? `<span class="badge st" title="Von BlueZ nicht gemeldet, nur direkt per HCI empfangen">versteckt</span>` : "") +
+        (d.connectable === false ? `<span class="badge st" title="Sendet nur, nimmt keine Verbindungen an">Sender</span>` : "");
+      const sigCell = d.probe_only
+        ? `<span class="sig" title="Antwortet auf Namensabfrage, sendet aber nicht sichtbar">${bars(null)}<span>erreichbar</span></span>`
+        : `<span class="sig">${bars(d.rssi)}<span>${d.rssi ?? "–"} dBm</span></span>`;
       const main = `<tr class="row${open.has(d.mac) ? " open" : ""}${d.age > 30 ? " stale" : ""}" data-mac="${esc(d.mac)}">
-          <td class="sigc"><span class="sig">${bars(d.rssi)}<span>${d.rssi ?? "–"} dBm</span></span></td>
+          <td class="sigc">${sigCell}</td>
           <td class="name" title="${esc(d.name || "")}">${d.name ? esc(d.name) : `<span class="unk">unbekannt</span>`}${st}</td>
           <td class="mac">${esc(d.mac)}</td>
           <td class="vendor" title="${esc(d.vendor || "")}">${esc(d.vendor || "–")}</td>
@@ -325,6 +332,8 @@
 
     const db = (s.databases || []).join(", ");
     $("foot").textContent = `${list.length} von ${all.length} angezeigt · ${s.known_devices ?? 0} Geräte seit Start bekannt` +
+      (s.hci ? ` · Direktempfang (HCI): ${s.hci}${s.hci === "aktiv" ? ", " + (s.hci_packets ?? 0).toLocaleString("de") + " Pakete" : ""}` : "") +
+      (s.probe ? ` · Namensabfrage: ${s.probe}` : "") +
       (s.deep ? " · GATT-Abfrage aktiv" : "") + (db ? ` · Datenbanken: ${db}` : " · keine Hersteller-Datenbank geladen (--update-db)");
   }
 
