@@ -127,6 +127,22 @@ Wenn `bluetoothctl list` im Container den Adapter anzeigt, ist alles bereit. Son
 
 4. Prüfen im Container: `lsusb`, `btmgmt info`, `bluetoothctl list`.
 
+### Fehler `org.bluez.Error.Failed: Authentication Failed` beim Einschalten
+
+Die Meldung ist irreführend. Der Kernel meldet damit einen **Timeout**: Der Dongle hat auf den
+Einschaltbefehl nicht geantwortet. Meist fehlt die Firmware. Sie wird vom **Host**-Kernel geladen,
+nicht im Container. So gehst du vor:
+
+```bash
+# auf dem Proxmox-Host
+dmesg | grep -iE 'bluetooth|btusb|rtl|firmware'   # z.B. "rtl_bt/rtl8761bu_fw.bin failed with error -2"
+apt install pve-firmware                          # bzw. linux-firmware / firmware-realtek
+systemctl disable --now bluetooth                 # kein zweiter bluetoothd auf dem Host
+rfkill unblock bluetooth
+# Dongle ab- und wieder anstecken, dann im Container:
+btmgmt power on && bluetoothctl show
+```
+
 ## Als Dienst laufen lassen (optional)
 
 `/etc/systemd/system/bt-scan.service`:

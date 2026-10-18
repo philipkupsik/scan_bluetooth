@@ -623,6 +623,33 @@ class DBusError(Exception):
     pass
 
 
+def rfkill_blocked():
+    """Liefert die per rfkill gesperrten Bluetooth-Geraete, z.B. ['hci0 (soft)']."""
+    out = []
+    base = "/sys/class/rfkill"
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return out
+    for entry in entries:
+        try:
+            with open(os.path.join(base, entry, "type")) as f:
+                if f.read().strip() != "bluetooth":
+                    continue
+            with open(os.path.join(base, entry, "name")) as f:
+                name = f.read().strip()
+            kinds = []
+            for kind in ("soft", "hard"):
+                with open(os.path.join(base, entry, kind)) as f:
+                    if f.read().strip() == "1":
+                        kinds.append(kind)
+            if kinds:
+                out.append(f"{name} ({'/'.join(kinds)})")
+        except OSError:
+            continue
+    return out
+
+
 class Scanner:
     def __init__(self, args, db):
         self.args = args
@@ -690,8 +717,7 @@ class Scanner:
         await self.add_match(f"type='signal',sender='{BLUEZ}',interface='{IFACE_PROPS}',member='PropertiesChanged'")
 
         if not self.adapter_props.get("Powered"):
-            await self.set_prop(self.adapter_path, IFACE_ADAPTER, "Powered", "b", True)
-            await asyncio.sleep(1)
+            await self.power_on()
 
         # Bereits bekannte Geraete uebernehmen (nur mit aktuellem RSSI als "gesehen")
         for path, ifaces in objs.items():
@@ -705,6 +731,43 @@ class Scanner:
         except DBusError as e:
             print(f"Warnung: SetDiscoveryFilter fehlgeschlagen ({e})", file=sys.stderr)
         await self.start_discovery()
+
+    async def power_on(self):
+        """Adapter einschalten; bei Fehlern mehrfach versuchen und dann eine Diagnose ausgeben."""
+        error = None
+        for attempt in range(5):
+            try:
+                await self.set_prop(self.adapter_path, IFACE_ADAPTER, "Powered", "b", True)
+            except DBusError as e:
+                error = e
+            await asyncio.sleep(1 + attempt)
+            try:
+                if await self.get_prop(self.adapter_path, IFACE_ADAPTER, "Powered"):
+                    return
+            except DBusError:
+                pass
+        hci = self.adapter_path.rsplit("/", 1)[-1]
+        blocked = rfkill_blocked()
+        lines = [f"Adapter {hci} laesst sich nicht einschalten: {error}", ""]
+        if blocked:
+            lines += [f"Ursache: Funk ist per rfkill gesperrt ({', '.join(blocked)}).",
+                      "  -> rfkill unblock bluetooth   (ggf. auf dem Proxmox-Host ausfuehren)", ""]
+        if error and "Authentication Failed" in str(error):
+            lines += ["'Authentication Failed' ist hier irrefuehrend: Der Kernel meldet damit einen TIMEOUT -",
+                      "der USB-Dongle hat beim Einschalten nicht geantwortet.", ""]
+        lines += [
+            "Typische Ursachen und Abhilfe:",
+            "  1. Firmware fehlt (v.a. Realtek/Intel/Broadcom-Dongles). Wird vom HOST-Kernel geladen:",
+            "     auf dem Proxmox-Host:  dmesg | grep -iE 'bluetooth|btusb|rtl|firmware'",
+            "     fehlt Firmware -> auf dem Host: apt install pve-firmware (Proxmox) bzw. linux-firmware,",
+            "     dann Dongle ab- und wieder anstecken.",
+            "  2. Ein zweiter bluetoothd (auf dem Host oder in einem anderen Container) belegt den Adapter:",
+            "     auf dem Host:  systemctl disable --now bluetooth",
+            "  3. Dongle haengt: abstecken/anstecken oder im Container:",
+            f"     btmgmt --index {hci.replace('hci', '')} power off; btmgmt --index {hci.replace('hci', '')} power on",
+            "  4. Pruefen:  btmgmt info   /   bluetoothctl show   /   rfkill list",
+        ]
+        raise SystemExit("\n".join(lines))
 
     async def start_discovery(self):
         try:
